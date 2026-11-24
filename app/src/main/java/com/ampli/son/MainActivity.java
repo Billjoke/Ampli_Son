@@ -38,7 +38,7 @@ import java.util.Locale;
 public class MainActivity extends Activity {
 
     private static final int REQ_MIC = 42;
-    private static final int GAIN_MIN = -10, GAIN_MAX = 30;
+    private static final int GAIN_MIN = -10, GAIN_MAX = 40;
     private static final int THR_MIN = -30, THR_MAX = 0;
 
     // Types de sorties "casque" (valeurs numériques pour compatibilité API)
@@ -54,7 +54,9 @@ public class MainActivity extends Activity {
     private final List<AudioDeviceInfo> inDevices = new ArrayList<>(); // index 0 = null (auto)
     private TextView gainLText, gainRText, thrText, banner, statusText, volText, noDeviceText;
     private SeekBar gainLBar, gainRBar, thrBar, volBar;
-    private CheckBox linkBox, muteLBox, muteRBox, limBox, vibBox, hpBox;
+    private CheckBox linkBox, muteLBox, muteRBox, limBox, vibBox, hpBox, focusBox, agcBox;
+    private TextView headsetNote, nrText, agcText;
+    private SeekBar nrBar;
     private Button startBtn;
     private LevelMeter meter;
     private boolean syncing = false;
@@ -80,7 +82,7 @@ public class MainActivity extends Activity {
         @Override
         public void onAudioDevicesRemoved(AudioDeviceInfo[] removed) {
             AudioDeviceInfo cur = engine.getOutputDevice();
-            if (cur != null && engine.isRunning()) {
+            if (cur != null && engine.isRunning() && !engine.headsetMicActive) {
                 for (AudioDeviceInfo d : removed) {
                     if (d.getId() == cur.getId()) {
                         stopAmp();
@@ -252,8 +254,21 @@ public class MainActivity extends Activity {
             public void onItemSelected(AdapterView<?> p, View v, int pos, long id) {
                 if (pos >= 0 && pos < inDevices.size()) {
                     AudioDeviceInfo d = inDevices.get(pos);
+                    boolean wasHeadset = AudioEngine.isHeadsetMic(engine.getInputDevice());
+                    boolean isHeadset = AudioEngine.isHeadsetMic(d);
                     engine.setInputDevice(d);
-                    prefs.edit().putString("in", d == null ? "" : deviceKey(d)).apply();
+                    prefs.edit().putString("in2", d == null ? "" : deviceKey(d)).apply();
+                    headsetNote.setVisibility(isHeadset ? View.VISIBLE : View.GONE);
+                    // changer de type de micro demande de relancer l'audio
+                    if (engine.isRunning() && wasHeadset != isHeadset) {
+                        stopAmp();
+                        handler.postDelayed(new Runnable() {
+                            @Override
+                            public void run() {
+                                requestStart();
+                            }
+                        }, 800);
+                    }
                 }
             }
 
@@ -261,7 +276,15 @@ public class MainActivity extends Activity {
             public void onNothingSelected(AdapterView<?> p) {
             }
         });
-        inCard.addView(label("Mode de captation (appliqué au prochain démarrage)", 13, false, 0xFF546E7A));
+        headsetNote = label("Micro des écouteurs : le Bluetooth passe en mode « appel ». "
+                + "Le son devient mono (même niveau dans les deux oreilles) et en qualité "
+                + "téléphone, mais il y a moins de retard. Attention : les écouteurs sont "
+                + "souvent réglés pour capter surtout VOTRE voix ; essayez aussi le micro du "
+                + "téléphone posé près de votre interlocuteur.", 12, false, 0xFF6A1B9A);
+        headsetNote.setVisibility(View.GONE);
+        inCard.addView(headsetNote);
+        inCard.addView(label("Mode de captation du micro du téléphone (appliqué au prochain démarrage)",
+                13, false, 0xFF546E7A));
         modeSpinner = new Spinner(this);
         ArrayAdapter<String> ma = new ArrayAdapter<>(this,
                 android.R.layout.simple_spinner_item, MODE_LABELS);
@@ -291,6 +314,55 @@ public class MainActivity extends Activity {
             }
         });
         inCard.addView(hpBox);
+
+        // Voix
+        LinearLayout vxCard = card(root, "Voix");
+        focusBox = new CheckBox(this);
+        focusBox.setText("Concentrer sur la voix (atténue graves et aigus, renforce les consonnes)");
+        focusBox.setChecked(engine.voiceFocus);
+        vxCard.addView(focusBox);
+        nrText = label("", 15, true, 0xFF263238);
+        nrText.setPadding(0, dp(8), 0, 0);
+        vxCard.addView(nrText);
+        nrBar = seek(0, 100);
+        nrBar.setProgress(Math.round(engine.noiseReduction * 100));
+        vxCard.addView(nrBar);
+        agcBox = new CheckBox(this);
+        agcBox.setText("Remonter automatiquement les voix faibles");
+        agcBox.setChecked(engine.autoGain);
+        vxCard.addView(agcBox);
+        agcText = label("", 13, false, 0xFF546E7A);
+        vxCard.addView(agcText);
+        vxCard.addView(label("La réduction de bruit atténue les sons continus (ventilation, moteur, "
+                + "brouhaha de fond). Trop forte, elle peut rendre la voix métallique : "
+                + "50 à 70 % est un bon point de départ.", 12, false, 0xFF78909C));
+        updateNrLabel();
+        nrBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar s, int p, boolean fromUser) {
+                engine.noiseReduction = p / 100f;
+                updateNrLabel();
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar s) {
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar s) {
+                savePrefs();
+            }
+        });
+        CompoundButton.OnCheckedChangeListener voiceListener = new CompoundButton.OnCheckedChangeListener() {
+            @Override
+            public void onCheckedChanged(CompoundButton b, boolean c) {
+                engine.voiceFocus = focusBox.isChecked();
+                engine.autoGain = agcBox.isChecked();
+                savePrefs();
+            }
+        };
+        focusBox.setOnCheckedChangeListener(voiceListener);
+        agcBox.setOnCheckedChangeListener(voiceListener);
 
         // Gains par oreille
         LinearLayout gCard = card(root, "Amplification par oreille");
@@ -478,6 +550,8 @@ public class MainActivity extends Activity {
                         + "• Le Bluetooth ajoute un léger retard (environ 0,1 à 0,3 s) : "
                         + "c'est une limite du Bluetooth, pas de l'application.\n"
                         + "• Gardez le téléphone éloigné des écouteurs pour éviter le sifflement (larsen).\n"
+                        + "• Pour mieux entendre une personne, posez le téléphone près d'elle et "
+                        + "choisissez le micro du téléphone.\n"
                         + "• Si le casque se déconnecte, l'amplification s'arrête automatiquement.\n"
                         + "• Cette application n'est pas un dispositif médical et ne remplace pas "
                         + "un appareil auditif prescrit.",
@@ -501,6 +575,12 @@ public class MainActivity extends Activity {
                 thrBar.getProgress() + THR_MIN));
     }
 
+    private void updateNrLabel() {
+        int p = nrBar.getProgress();
+        nrText.setText(p == 0 ? "Réduction de bruit : désactivée"
+                : String.format(Locale.FRANCE, "Réduction de bruit : %d %%", p));
+    }
+
     private void updateVolLabel() {
         int max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
         int v = am.getStreamVolume(AudioManager.STREAM_MUSIC);
@@ -518,8 +598,8 @@ public class MainActivity extends Activity {
         startBtn.setTextColor(0xFFFFFFFF);
         if (on) {
             String routed = engine.routedOutputName;
-            statusText.setText("En cours" + (routed != null && routed.length() > 0
-                    ? " – sortie : " + routed : ""));
+            statusText.setText("En cours" + (engine.headsetMicActive ? " (micro des écouteurs, mono)" : "")
+                    + (routed != null && routed.length() > 0 ? " – sortie : " + routed : ""));
         } else {
             statusText.setText("Arrêté");
         }
@@ -539,6 +619,12 @@ public class MainActivity extends Activity {
         if (engine.errorSerial != seenErrorSerial) {
             seenErrorSerial = engine.errorSerial;
             if (engine.lastError != null) showError(engine.lastError);
+        }
+        if (engine.isRunning() && engine.autoGain) {
+            agcText.setText(String.format(Locale.FRANCE, "Remontée automatique actuelle : %+.0f dB",
+                    engine.agcDb));
+        } else {
+            agcText.setText("");
         }
         if (++tick % 10 == 0 && !volTouching) {
             volBar.setMax(am.getStreamMaxVolume(AudioManager.STREAM_MUSIC));
@@ -640,6 +726,12 @@ public class MainActivity extends Activity {
         List<String> inLabels = new ArrayList<>();
         inLabels.add("Micro du téléphone (automatique)");
         for (AudioDeviceInfo d : am.getDevices(AudioManager.GET_DEVICES_INPUTS)) {
+            if (AudioEngine.isHeadsetMic(d)) {
+                inDevices.add(d);
+                inLabels.add("Micro des écouteurs : " + d.getProductName() + " (Bluetooth)");
+            }
+        }
+        for (AudioDeviceInfo d : am.getDevices(AudioManager.GET_DEVICES_INPUTS)) {
             int t = d.getType();
             if (t == AudioDeviceInfo.TYPE_BUILTIN_MIC || t == AudioDeviceInfo.TYPE_WIRED_HEADSET
                     || t == AudioDeviceInfo.TYPE_USB_DEVICE || t == AudioDeviceInfo.TYPE_USB_HEADSET) {
@@ -659,11 +751,25 @@ public class MainActivity extends Activity {
                 android.R.layout.simple_spinner_item, inLabels);
         ia.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         inSpinner.setAdapter(ia);
-        String savedIn = prefs.getString("in", "");
+        String savedIn = prefs.getString("in2", null);
         int isel = 0;
+        AudioDeviceInfo curIn = engine.getInputDevice();
+        boolean found = false;
         for (int i = 1; i < inDevices.size(); i++) {
-            if (deviceKey(inDevices.get(i)).equals(savedIn)) { isel = i; break; }
+            AudioDeviceInfo d = inDevices.get(i);
+            if (curIn != null && d.getId() == curIn.getId()) { isel = i; found = true; break; }
         }
+        if (!found && savedIn != null) {
+            for (int i = 1; i < inDevices.size(); i++) {
+                if (deviceKey(inDevices.get(i)).equals(savedIn)) { isel = i; break; }
+            }
+        } else if (!found) {
+            // premier lancement : micro des écouteurs par défaut s'il existe
+            for (int i = 1; i < inDevices.size(); i++) {
+                if (AudioEngine.isHeadsetMic(inDevices.get(i))) { isel = i; break; }
+            }
+        }
+        headsetNote.setVisibility(AudioEngine.isHeadsetMic(inDevices.get(isel)) ? View.VISIBLE : View.GONE);
         inSpinner.setSelection(isel);
         engine.setInputDevice(inDevices.get(isel));
     }
@@ -677,14 +783,19 @@ public class MainActivity extends Activity {
                     + "jamais le son amplifié sur le haut-parleur du téléphone.)");
             return;
         }
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+        List<String> need = new ArrayList<>();
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            need.add(Manifest.permission.RECORD_AUDIO);
+            if (android.os.Build.VERSION.SDK_INT >= 33) need.add("android.permission.POST_NOTIFICATIONS");
+        }
+        if (android.os.Build.VERSION.SDK_INT >= 31
+                && AudioEngine.isHeadsetMic(engine.getInputDevice())
+                && checkSelfPermission("android.permission.BLUETOOTH_CONNECT")
                 != PackageManager.PERMISSION_GRANTED) {
-            if (android.os.Build.VERSION.SDK_INT >= 33) {
-                requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO,
-                        "android.permission.POST_NOTIFICATIONS"}, REQ_MIC);
-            } else {
-                requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_MIC);
-            }
+            need.add("android.permission.BLUETOOTH_CONNECT");
+        }
+        if (!need.isEmpty()) {
+            requestPermissions(need.toArray(new String[0]), REQ_MIC);
             return;
         }
         startAmp();
@@ -693,7 +804,8 @@ public class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
         if (code == REQ_MIC) {
-            if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) {
+            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                    == PackageManager.PERMISSION_GRANTED) {
                 startAmp();
             } else {
                 showError("L'accès au micro est nécessaire pour amplifier le son. "
@@ -723,10 +835,13 @@ public class MainActivity extends Activity {
         engine.gainRightDb = prefs.getInt("gr", 10);
         engine.muteLeft = prefs.getBoolean("ml", false);
         engine.muteRight = prefs.getBoolean("mr", false);
-        engine.thresholdDb = prefs.getInt("thr", -6);
+        engine.thresholdDb = prefs.getInt("thr", -3);
         engine.limiterEnabled = prefs.getBoolean("lim", true);
         engine.vibrateOnAlert = prefs.getBoolean("vib", true);
         engine.highPassEnabled = prefs.getBoolean("hp", true);
+        engine.voiceFocus = prefs.getBoolean("focus", true);
+        engine.autoGain = prefs.getBoolean("agc", true);
+        engine.noiseReduction = prefs.getInt("nr", 60) / 100f;
         int mode = Math.max(0, Math.min(2, prefs.getInt("mode", 0)));
         engine.audioSource = MODE_SOURCES[mode];
     }
@@ -743,6 +858,9 @@ public class MainActivity extends Activity {
                 .putBoolean("vib", vibBox.isChecked())
                 .putBoolean("hp", hpBox.isChecked())
                 .putBoolean("link", linkBox.isChecked())
+                .putBoolean("focus", focusBox.isChecked())
+                .putBoolean("agc", agcBox.isChecked())
+                .putInt("nr", nrBar.getProgress())
                 .apply();
     }
 }
